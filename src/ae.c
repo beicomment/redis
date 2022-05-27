@@ -47,6 +47,8 @@
 #include "zmalloc.h"
 #include "config.h"
 
+/// 根据编译机器选择性能最好的多路适配库
+/// 所有的适配函数api都一致，底层调用不同的库实现监听
 /* Include the best multiplexing layer supported by this system.
  * The following should be ordered by performances, descending. */
 #ifdef HAVE_EVPORT
@@ -64,6 +66,7 @@
 #endif
 
 
+/// 初始化事件循环处理器
 aeEventLoop *aeCreateEventLoop(int setsize) {
     aeEventLoop *eventLoop;
     int i;
@@ -155,21 +158,33 @@ void aeStop(aeEventLoop *eventLoop) {
     eventLoop->stop = 1;
 }
 
+/// 对于 socket(fd) 注册指定的事件组mask和对应的事件处理器proc
+/// 对于已经注册过的fd，追加新注册的事件类型
+/// POSIX: fd:0->stdin fd:1->stdout fd:2->stderr
+/// fd值总是为当前可用的最小值
 int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         aeFileProc *proc, void *clientData)
 {
+    /// option 超限直接返回错误
     if (fd >= eventLoop->setsize) {
         errno = ERANGE;
         return AE_ERR;
     }
+    /// 取出fd所关联的文件事件
     aeFileEvent *fe = &eventLoop->events[fd];
 
+    /// 使用具体的多路复用实现监听fd
     if (aeApiAddEvent(eventLoop, fd, mask) == -1)
         return AE_ERR;
+    /// 更新事件所绑定的事件类型
     fe->mask |= mask;
+    /// 读事件 -> 绑定读事件处理器
     if (mask & AE_READABLE) fe->rfileProc = proc;
+    /// 写事件 -> 绑定写事件处理器
     if (mask & AE_WRITABLE) fe->wfileProc = proc;
+    /// 事件相关的元信息
     fe->clientData = clientData;
+    /// option 更新当前已注册的最大fd值
     if (fd > eventLoop->maxfd)
         eventLoop->maxfd = fd;
     return AE_OK;
@@ -177,16 +192,22 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
 
 void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask)
 {
+    /// 超限直接返回
     if (fd >= eventLoop->setsize) return;
+    /// 取出fd所关联的文件事件
     aeFileEvent *fe = &eventLoop->events[fd];
+    /// 如果没有绑定任何事件 -> 直接返回
     if (fe->mask == AE_NONE) return;
 
     /* We want to always remove AE_BARRIER if set when AE_WRITABLE
      * is removed. */
     if (mask & AE_WRITABLE) mask |= AE_BARRIER;
 
+    /// 使用具体的多路复用实现取消监听fd
     aeApiDelEvent(eventLoop, fd, mask);
+    /// 更新对应监听的事件
     fe->mask = fe->mask & (~mask);
+    /// option 更新当前已注册的最大fd值
     if (fd == eventLoop->maxfd && fe->mask == AE_NONE) {
         /* Update the max fd */
         int j;
@@ -205,6 +226,7 @@ void *aeGetFileClientData(aeEventLoop *eventLoop, int fd) {
     return fe->clientData;
 }
 
+/// 获取当前fd所监听的事件类型
 int aeGetFileEvents(aeEventLoop *eventLoop, int fd) {
     if (fd >= eventLoop->setsize) return 0;
     aeFileEvent *fe = &eventLoop->events[fd];
@@ -354,10 +376,13 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
  * if flags has AE_CALL_BEFORE_SLEEP set, the beforesleep callback is called.
  *
  * The function returns the number of events processed. */
+/// flags -> 需要处理的事件掩码
 int aeProcessEvents(aeEventLoop *eventLoop, int flags)
 {
+    /// 处理的时间/文件事件数 & 触发的文件事件数
     int processed = 0, numevents;
 
+    /// as soon as possible
     /* Nothing to do? return ASAP */
     if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
 
@@ -368,13 +393,17 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
     if (eventLoop->maxfd != -1 ||
         ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
         int j;
+        /// 等待时间 tv用于给tvp取地址
         struct timeval tv, *tvp;
         int64_t usUntilTimer = -1;
 
+        /// 如果需要监听时间事件并且没有设置【不阻塞等待】
         if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
+            /// 最小需要等待的微秒数
             usUntilTimer = usUntilEarliestTimer(eventLoop);
 
         if (usUntilTimer >= 0) {
+            /// 存在需要等待的时间事件
             tv.tv_sec = usUntilTimer / 1000000;
             tv.tv_usec = usUntilTimer % 1000000;
             tvp = &tv;
@@ -386,31 +415,45 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
                 tv.tv_sec = tv.tv_usec = 0;
                 tvp = &tv;
             } else {
+                /// 可以阻塞等待文件事件
                 /* Otherwise we can block */
                 tvp = NULL; /* wait forever */
             }
         }
 
+        /// 事件循环设置了【不阻塞等待】
+        /// fixme: 这里的判断是不是能移到上面，避免设置了无需等待而每次都去获取下一个时间事件的等待时间
         if (eventLoop->flags & AE_DONT_WAIT) {
+            /// 等待时间置零
             tv.tv_sec = tv.tv_usec = 0;
             tvp = &tv;
         }
 
+        /// 设置了等待前处理器
         if (eventLoop->beforesleep != NULL && flags & AE_CALL_BEFORE_SLEEP)
             eventLoop->beforesleep(eventLoop);
 
         /* Call the multiplexing API, will return only on timeout or when
          * some event fires. */
+        /// 调用多路复用API来获取文件事件
+        /// 所有被触发的文件事件会维护在 eventLoop->fire (only include fd & mask field)
+        // todo 看下这个
         numevents = aeApiPoll(eventLoop, tvp);
 
         /* After sleep callback. */
+        /// 设置了等待后处理器
         if (eventLoop->aftersleep != NULL && flags & AE_CALL_AFTER_SLEEP)
             eventLoop->aftersleep(eventLoop);
 
+        /// 遍历所有触发的文件事件
         for (j = 0; j < numevents; j++) {
+            /// 获取 fd
             int fd = eventLoop->fired[j].fd;
+            /// 获取实际 event
             aeFileEvent *fe = &eventLoop->events[fd];
+            /// 触发的事件
             int mask = eventLoop->fired[j].mask;
+            /// 当前fd执行的事件数
             int fired = 0; /* Number of events fired for current fd. */
 
             /* Normally we execute the readable event first, and the writable
@@ -424,6 +467,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
              * This is useful when, for instance, we want to do things
              * in the beforeSleep() hook, like fsyncing a file to disk,
              * before replying to a client. */
+            /// 反转 -> 需要先执行写事件再执行读事件
             int invert = fe->mask & AE_BARRIER;
 
             /* Note the "fe->mask & mask & ..." code: maybe an already
@@ -432,6 +476,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
              *
              * Fire the readable event if the call sequence is not
              * inverted. */
+            /// 处理可读事件 未反转&&可读事件触发&&可读事件触发
             if (!invert && fe->mask & mask & AE_READABLE) {
                 fe->rfileProc(eventLoop,fd,fe->clientData,mask);
                 fired++;
@@ -439,6 +484,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             }
 
             /* Fire the writable event. */
+            /// 处理可写事件 注册了可写事件&&可写事件触发
             if (fe->mask & mask & AE_WRITABLE) {
                 if (!fired || fe->wfileProc != fe->rfileProc) {
                     fe->wfileProc(eventLoop,fd,fe->clientData,mask);
@@ -448,20 +494,26 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
 
             /* If we have to invert the call, fire the readable event now
              * after the writable one. */
+            /// 如果设置了反转，此时再执行可读事件
             if (invert) {
+                /// 重新取得注册的 event -> 可能因为 resize
                 fe = &eventLoop->events[fd]; /* Refresh in case of resize. */
                 if ((fe->mask & mask & AE_READABLE) &&
+                    // todo 这行
                     (!fired || fe->wfileProc != fe->rfileProc))
                 {
+                    /// 处理可读事件
                     fe->rfileProc(eventLoop,fd,fe->clientData,mask);
                     fired++;
                 }
             }
 
+            /// 更新处理的文件数
             processed++;
         }
     }
     /* Check time events */
+    /// 如果需要，则处理时间事件
     if (flags & AE_TIME_EVENTS)
         processed += processTimeEvents(eventLoop);
 
@@ -492,6 +544,7 @@ int aeWait(int fd, int mask, long long milliseconds) {
 
 void aeMain(aeEventLoop *eventLoop) {
     eventLoop->stop = 0;
+    /// 进入事件循环
     while (!eventLoop->stop) {
         aeProcessEvents(eventLoop, AE_ALL_EVENTS|
                                    AE_CALL_BEFORE_SLEEP|

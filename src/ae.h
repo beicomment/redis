@@ -38,6 +38,7 @@
 #define AE_OK 0
 #define AE_ERR -1
 
+/// 所有的事件类型通过位mask的方式组合
 #define AE_NONE 0       /* No events registered. */
 #define AE_READABLE 1   /* Fire when descriptor is readable. */
 #define AE_WRITABLE 2   /* Fire when descriptor is writable. */
@@ -70,8 +71,11 @@ typedef void aeBeforeSleepProc(struct aeEventLoop *eventLoop);
 
 /* File event structure */
 typedef struct aeFileEvent {
+    /// 需要监听的事件类型掩码
     int mask; /* one of AE_(READABLE|WRITABLE|BARRIER) */
+    /// 读事件处理器
     aeFileProc *rfileProc;
+    /// 写事件处理器
     aeFileProc *wfileProc;
     void *clientData;
 } aeFileEvent;
@@ -100,6 +104,7 @@ typedef struct aeEventLoop {
     int maxfd;   /* highest file descriptor currently registered */
     int setsize; /* max number of file descriptors tracked */
     long long timeEventNextId;
+    /// 所有注册的文件事件
     aeFileEvent *events; /* Registered events */
     aeFiredEvent *fired; /* Fired events */
     aeTimeEvent *timeEventHead;
